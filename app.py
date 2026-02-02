@@ -10,6 +10,12 @@ from PySide6.QtGui import QVector3D, QFont
 
 import pyqtgraph.opengl as gl
 import pyqtgraph as pg
+import matplotlib
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+from matplotlib.figure import Figure
+from mpl_toolkits.mplot3d import Axes3D
+from PySide6.QtWidgets import QStackedWidget, QDialog, QSizePolicy
 
 # ==========================================
 # 0. Localization
@@ -19,6 +25,7 @@ TRANSLATIONS = {
         'WINDOW_TITLE': "时空数据可视化与剖面分析工具 v1.0",
         'CONTROL_PANEL': "控制面板",
         'BTN_LOAD': "加载数据 (CSV)",
+        'BTN_EXPORT': "导出剖面图 (SVG/PNG)",
         'CHK_PROJECTION': "地球投影模式",
         'CHK_NORMALIZE': "数据归一化 (0-1)",
         'LBL_VAR_SELECT': "选择变量:",
@@ -46,6 +53,7 @@ TRANSLATIONS = {
         'WINDOW_TITLE': "Spatio-Temporal Data Visualization & Profile Analysis Tool v1.0",
         'CONTROL_PANEL': "Control Panel",
         'BTN_LOAD': "Load Data (CSV)",
+        'BTN_EXPORT': "Export Profile (SVG/PNG)",
         'CHK_PROJECTION': "Earth Projection Mode",
         'CHK_NORMALIZE': "Normalize Data (0-1)",
         'LBL_VAR_SELECT': "Select Variables:",
@@ -655,6 +663,13 @@ class SpatioTemporalViz(QMainWindow):
         right_layout = QVBoxLayout(right_widget)
         
         self.plot_widget = pg.PlotWidget()
+        # Academic Style: White background, Black axes
+        self.plot_widget.setBackground('w')
+        self.plot_widget.getAxis('bottom').setPen('k')
+        self.plot_widget.getAxis('left').setPen('k')
+        self.plot_widget.getAxis('bottom').setTextPen('k')
+        self.plot_widget.getAxis('left').setTextPen('k')
+        
         self.plot_widget.addLegend()
         right_layout.addWidget(self.plot_widget, stretch=1)
         
@@ -680,6 +695,16 @@ class SpatioTemporalViz(QMainWindow):
         slice_layout.addRow(self.lbl_start_lon, self.spin_lon1)
         slice_layout.addRow(self.lbl_end_lat, self.spin_lat2)
         slice_layout.addRow(self.lbl_end_lon, self.spin_lon2)
+        
+        self.btn_export = QPushButton()
+        self.btn_export.clicked.connect(self.export_slice_plot)
+        slice_layout.addRow(self.btn_export)
+        
+        # New Button for Multi-Site Analysis
+        self.btn_multi_analysis = QPushButton("时空演化分析 (Spatio-Temporal)")
+        self.btn_multi_analysis.clicked.connect(self.open_multi_analysis)
+        slice_layout.addRow(self.btn_multi_analysis)
+        
         right_layout.addWidget(self.slice_group)
         
         splitter.addWidget(left_widget)
@@ -727,6 +752,7 @@ class SpatioTemporalViz(QMainWindow):
         self.lbl_start_lon.setText(tr['LBL_START_LON'])
         self.lbl_end_lat.setText(tr['LBL_END_LAT'])
         self.lbl_end_lon.setText(tr['LBL_END_LON'])
+        self.btn_export.setText(tr.get('BTN_EXPORT', "Export"))
         
         # Update Plot Labels if data loaded
         if self.df is not None:
@@ -1074,6 +1100,61 @@ class SpatioTemporalViz(QMainWindow):
             n_lon = (x + 10) / 20.0
             return min_lat + n_lat*(max_lat-min_lat), min_lon + n_lon*(max_lon-min_lon)
 
+    def get_slice_data(self, n_samples=100):
+        if not self.grid_data: return None, None
+        
+        lat1, lon1 = self.spin_lat1.value(), self.spin_lon1.value()
+        lat2, lon2 = self.spin_lat2.value(), self.spin_lon2.value()
+        
+        sample_lat = np.linspace(lat1, lat2, n_samples)
+        sample_lon = np.linspace(lon1, lon2, n_samples)
+        
+        min_lat, max_lat = self.unique_lats[0], self.unique_lats[-1]
+        min_lon, max_lon = self.unique_lons[0], self.unique_lons[-1]
+        
+        results = {}
+        
+        for var in self.var_order:
+            # For update_slice_view we check active, but for export maybe we want all?
+            # Let's stick to active for now to match UI behavior.
+            if var not in self.active_variables: continue
+            
+            grid = self.grid_data[var][self.current_time_idx]
+            vals = []
+            
+            for i in range(n_samples):
+                # Map to grid indices
+                r = (sample_lat[i] - min_lat) / (max_lat - min_lat) * (grid.shape[0] - 1)
+                c = (sample_lon[i] - min_lon) / (max_lon - min_lon) * (grid.shape[1] - 1)
+                
+                if not (0 <= r <= grid.shape[0]-1 and 0 <= c <= grid.shape[1]-1):
+                    vals.append(np.nan)
+                    continue
+                
+                r0 = int(np.floor(r))
+                c0 = int(np.floor(c))
+                r1 = min(r0 + 1, grid.shape[0] - 1)
+                c1 = min(c0 + 1, grid.shape[1] - 1)
+                
+                dr = r - r0
+                dc = c - c0
+                
+                v00 = grid[r0, c0]
+                v01 = grid[r0, c1]
+                v10 = grid[r1, c0]
+                v11 = grid[r1, c1]
+                
+                if np.isnan([v00, v01, v10, v11]).any():
+                    vals.append(grid[int(round(r)), int(round(c))])
+                else:
+                    val = (1-dr)*(1-dc)*v00 + (1-dr)*dc*v01 + dr*(1-dc)*v10 + dr*dc*v11
+                    vals.append(val)
+            
+            results[var] = np.array(vals)
+            
+        dist_axis = np.linspace(0, 1, n_samples)
+        return dist_axis, results
+
     def update_slice_view(self):
         if not self.grid_data: return
         lat1, lon1 = self.spin_lat1.value(), self.spin_lon1.value()
@@ -1085,7 +1166,6 @@ class SpatioTemporalViz(QMainWindow):
         
         is_spherical = self.chk_projection.isChecked()
         if is_spherical:
-            # Lift indicators slightly
             p1 = p1 / (np.linalg.norm(p1) + 1e-9) * 20.5
             p2 = p2 / (np.linalg.norm(p2) + 1e-9) * 20.5
             
@@ -1107,61 +1187,15 @@ class SpatioTemporalViz(QMainWindow):
         
         # 2. Update 2D Plot
         self.plot_widget.clear()
-        
-        # Check normalization
         is_norm = self.chk_normalize.isChecked()
-        self.plot_widget.setLabel('left', '归一化数值 (0-1)' if is_norm else '原始数值')
+        tr = self.tr
+        self.plot_widget.setLabel('left', tr['PLOT_Y_NORM'] if is_norm else tr['PLOT_Y_RAW'])
         
-        n_samp = 100
-        sample_lat = np.linspace(lat1, lat2, n_samp)
-        sample_lon = np.linspace(lon1, lon2, n_samp)
+        dist_axis, results = self.get_slice_data(n_samples=100)
+        if results is None: return
         
-        min_lat, max_lat = self.unique_lats[0], self.unique_lats[-1]
-        min_lon, max_lon = self.unique_lons[0], self.unique_lons[-1]
-        
-        for var in self.var_order:
-            if var not in self.active_variables: continue
-            grid = self.grid_data[var][self.current_time_idx]
-            
-            vals = []
-            for i in range(n_samp):
-                # Map to grid indices (float)
-                # grid shape is (n_lat, n_lon) -> (row, col)
-                r = (sample_lat[i] - min_lat) / (max_lat - min_lat) * (grid.shape[0] - 1)
-                c = (sample_lon[i] - min_lon) / (max_lon - min_lon) * (grid.shape[1] - 1)
-                
-                # Check bounds
-                if not (0 <= r <= grid.shape[0]-1 and 0 <= c <= grid.shape[1]-1):
-                    vals.append(np.nan)
-                    continue
-                
-                # Bilinear Interpolation
-                r0 = int(np.floor(r))
-                c0 = int(np.floor(c))
-                r1 = min(r0 + 1, grid.shape[0] - 1)
-                c1 = min(c0 + 1, grid.shape[1] - 1)
-                
-                dr = r - r0
-                dc = c - c0
-                
-                v00 = grid[r0, c0]
-                v01 = grid[r0, c1]
-                v10 = grid[r1, c0]
-                v11 = grid[r1, c1]
-                
-                # If any neighbor is NaN, result is NaN (strict) or ignore (lenient)?
-                # Let's be lenient: if NaN, fallback to nearest valid or skip
-                # Simpler: just propagate NaN
-                if np.isnan([v00, v01, v10, v11]).any():
-                    # Fallback to nearest neighbor to avoid holes on boundaries
-                    vals.append(grid[int(round(r)), int(round(c))])
-                else:
-                    val = (1-dr)*(1-dc)*v00 + (1-dr)*dc*v01 + dr*(1-dc)*v10 + dr*dc*v11
-                    vals.append(val)
-            
-            vals = np.array(vals)
-            
-            # Normalization
+        for var, vals in results.items():
+            # Normalization logic
             if is_norm:
                 z_min = np.nanmin(self.grid_data[var])
                 z_max = np.nanmax(self.grid_data[var])
@@ -1170,10 +1204,79 @@ class SpatioTemporalViz(QMainWindow):
                 else:
                     vals = np.zeros_like(vals)
             
-            # Plot (connect='finite' skips NaNs)
             base_color = self.var_colors.get(var, (200, 200, 200))
             pen = pg.mkPen(color=base_color, width=2)
-            self.plot_widget.plot(np.linspace(0, 1, n_samp), vals, pen=pen, name=var, connect='finite')
+            self.plot_widget.plot(dist_axis, vals, pen=pen, name=var, connect='finite')
+
+    def export_slice_plot(self):
+        if not self.grid_data or not self.active_variables:
+            QMessageBox.warning(self, "Export", "No data to export.")
+            return
+
+        # High resolution data
+        dist_axis, results = self.get_slice_data(n_samples=200)
+        
+        # Create Matplotlib Figure
+        plt.style.use('default')
+        # Try to match academic style
+        font_options = {'font.family': 'sans-serif', 'font.sans-serif': ['Arial', 'Helvetica', 'DejaVu Sans']}
+        plt.rcParams.update(font_options)
+        
+        fig, ax = plt.subplots(figsize=(10, 6), dpi=300)
+        
+        is_norm = self.chk_normalize.isChecked()
+        
+        # Plot
+        for var, vals in results.items():
+            if is_norm:
+                z_min = np.nanmin(self.grid_data[var])
+                z_max = np.nanmax(self.grid_data[var])
+                if z_max > z_min:
+                    vals = (vals - z_min) / (z_max - z_min)
+                else:
+                    vals = np.zeros_like(vals)
+            
+            # Convert color from tuple (r,g,b) to #Hex
+            c_rgb = self.var_colors.get(var, (0,0,0))
+            c_hex = '#{:02x}{:02x}{:02x}'.format(*c_rgb)
+            
+            ax.plot(dist_axis, vals, label=var, color=c_hex, linewidth=2)
+            
+        # Styling
+        ax.set_xlabel(self.tr['PLOT_X'], fontsize=12, fontweight='bold')
+        ax.set_ylabel(self.tr['PLOT_Y_NORM'] if is_norm else self.tr['PLOT_Y_RAW'], fontsize=12, fontweight='bold')
+        
+        # Title
+        title = f"Slice Profile: Lat({self.spin_lat1.value():.1f}->{self.spin_lat2.value():.1f}), Lon({self.spin_lon1.value():.1f}->{self.spin_lon2.value():.1f})"
+        ax.set_title(title, fontsize=14)
+        
+        ax.legend(frameon=False, loc='best')
+        ax.grid(True, linestyle='--', alpha=0.5)
+        
+        # Clean spines
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.tick_params(direction='in')
+        
+        # File Dialog
+        filename, filter_type = QFileDialog.getSaveFileName(self, self.tr['BTN_EXPORT'], "", "PNG Image (*.png);;SVG Image (*.svg);;PDF Document (*.pdf)")
+        
+        if filename:
+            try:
+                fig.savefig(filename, bbox_inches='tight', dpi=300)
+                QMessageBox.information(self, "Success", f"Saved to {filename}")
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to save: {str(e)}")
+        
+        plt.close(fig)
+
+    def open_multi_analysis(self):
+        if not self.grid_data:
+            QMessageBox.warning(self, "Warning", "Please load data first.")
+            return
+            
+        self.multi_win = MultiSiteVizWindow(self)
+        self.multi_win.show()
 
     def on_var_check_changed(self):
         sender = self.sender()
@@ -1214,6 +1317,354 @@ class SpatioTemporalViz(QMainWindow):
             self.lbl_time.setText(f"时间: {self.unique_times[value]:.2f}")
             self.update_plot()
             self.update_slice_view()
+
+# ==========================================
+# 4. Spatio-Temporal Evolution Window
+# ==========================================
+class MultiSiteVizWindow(QMainWindow):
+    def __init__(self, parent_viz):
+        super().__init__()
+        self.parent_viz = parent_viz
+        self.setWindowTitle("时空演化立体分析 (Spatio-Temporal Evolution Analysis)")
+        self.resize(1000, 800)
+        
+        self.init_ui()
+        self.update_data()
+        
+    def init_ui(self):
+        main_widget = QWidget()
+        self.setCentralWidget(main_widget)
+        layout = QVBoxLayout(main_widget)
+        
+        # --- Control Panel ---
+        controls = QGroupBox("Analysis Controls")
+        c_layout = QHBoxLayout(controls)
+        
+        # View Mode
+        c_layout.addWidget(QLabel("View Mode:"))
+        self.combo_mode = QComboBox()
+        self.combo_mode.addItems(["3D Stereo (Interactive)", "2D Ridge Plot (Stacked)", "2D Heatmap"])
+        self.combo_mode.currentIndexChanged.connect(self.on_mode_changed)
+        c_layout.addWidget(self.combo_mode)
+        
+        # Variable
+        c_layout.addWidget(QLabel("Variable:"))
+        self.combo_var = QComboBox()
+        # Populate variables
+        self.combo_var.addItems(self.parent_viz.var_order)
+        self.combo_var.currentIndexChanged.connect(self.update_view)
+        c_layout.addWidget(self.combo_var)
+        
+        # Samples
+        c_layout.addWidget(QLabel("Samples:"))
+        self.spin_samples = QDoubleSpinBox() # Hack: use double spin box for integer to get clean UI? No, QSpinBox
+        # Wait, QSpinBox is better
+        from PySide6.QtWidgets import QSpinBox
+        self.spin_samples = QSpinBox()
+        self.spin_samples.setRange(10, 200)
+        self.spin_samples.setValue(50)
+        self.spin_samples.setSingleStep(10)
+        self.spin_samples.valueChanged.connect(self.update_data)
+        c_layout.addWidget(self.spin_samples)
+        
+        # Export
+        self.btn_export = QPushButton("Export (SVG/PNG/PDF)")
+        self.btn_export.clicked.connect(self.export_view)
+        c_layout.addWidget(self.btn_export)
+        
+        c_layout.addStretch()
+        layout.addWidget(controls)
+        
+        # --- View Stack ---
+        self.stack = QStackedWidget()
+        layout.addWidget(self.stack, stretch=1)
+        
+        # 1. 3D View (PyQtGraph)
+        self.gl_view = gl.GLViewWidget()
+        self.gl_view.setCameraPosition(distance=40, elevation=30, azimuth=-90)
+        self.stack.addWidget(self.gl_view)
+        
+        # 2. 2D View (Matplotlib)
+        self.fig = Figure(figsize=(8, 6), dpi=100)
+        self.canvas = FigureCanvasQTAgg(self.fig)
+        self.stack.addWidget(self.canvas)
+        
+    def get_spacetime_data(self):
+        """
+        Extracts matrix: Rows=Time, Cols=Location (Distance along slice)
+        Returns: times, dists, matrix (T x D)
+        """
+        var = self.combo_var.currentText()
+        if not var or var not in self.parent_viz.grid_data:
+            return None, None, None
+            
+        n_samples = self.spin_samples.value()
+        times = self.parent_viz.unique_times
+        n_times = len(times)
+        
+        # Get slice coords
+        lat1, lon1 = self.parent_viz.spin_lat1.value(), self.parent_viz.spin_lon1.value()
+        lat2, lon2 = self.parent_viz.spin_lat2.value(), self.parent_viz.spin_lon2.value()
+        
+        sample_lat = np.linspace(lat1, lat2, n_samples)
+        sample_lon = np.linspace(lon1, lon2, n_samples)
+        dists = np.linspace(0, 1, n_samples)
+        
+        # Grid info
+        min_lat, max_lat = self.parent_viz.unique_lats[0], self.parent_viz.unique_lats[-1]
+        min_lon, max_lon = self.parent_viz.unique_lons[0], self.parent_viz.unique_lons[-1]
+        
+        full_grid = self.parent_viz.grid_data[var] # Shape (T, Lat, Lon)
+        
+        # Pre-calculate grid indices for the slice (constant over time)
+        # grid shape is (n_t, n_lat, n_lon)
+        # We need indices for lat/lon dimensions (1 and 2)
+        
+        n_lat_grid = full_grid.shape[1]
+        n_lon_grid = full_grid.shape[2]
+        
+        r_float = (sample_lat - min_lat) / (max_lat - min_lat) * (n_lat_grid - 1)
+        c_float = (sample_lon - min_lon) / (max_lon - min_lon) * (n_lon_grid - 1)
+        
+        # Clip
+        r_float = np.clip(r_float, 0, n_lat_grid - 1)
+        c_float = np.clip(c_float, 0, n_lon_grid - 1)
+        
+        # Vectorized Bilinear Interpolation for all time steps?
+        # Maybe too heavy to do fully vectorized with meshgrid logic?
+        # Let's do a semi-vectorized approach: Interpolate spatial slice first, then apply to all T
+        
+        # Indices
+        r0 = np.floor(r_float).astype(int)
+        c0 = np.floor(c_float).astype(int)
+        r1 = np.minimum(r0 + 1, n_lat_grid - 1)
+        c1 = np.minimum(c0 + 1, n_lon_grid - 1)
+        
+        dr = r_float - r0
+        dc = c_float - c0
+        
+        # full_grid is (T, R, C)
+        # We want to extract (T, Sample)
+        
+        # Advanced indexing
+        # v00 shape will be (T, Samples)
+        v00 = full_grid[:, r0, c0]
+        v01 = full_grid[:, r0, c1]
+        v10 = full_grid[:, r1, c0]
+        v11 = full_grid[:, r1, c1]
+        
+        # Weights (broadcast over T)
+        w00 = (1-dr)*(1-dc)
+        w01 = (1-dr)*dc
+        w10 = dr*(1-dc)
+        w11 = dr*dc
+        
+        # Result (T, Samples)
+        matrix = v00 * w00 + v01 * w01 + v10 * w10 + v11 * w11
+        
+        return times, dists, matrix
+
+    def update_data(self):
+        self.update_view()
+
+    def on_mode_changed(self):
+        mode = self.combo_mode.currentIndex()
+        if mode == 0:
+            self.stack.setCurrentIndex(0)
+        else:
+            self.stack.setCurrentIndex(1)
+        self.update_view()
+
+    def update_view(self):
+        times, dists, matrix = self.get_spacetime_data()
+        if matrix is None: return
+        
+        mode = self.combo_mode.currentIndex()
+        
+        if mode == 0:
+            self.plot_3d(times, dists, matrix)
+        elif mode == 1:
+            self.plot_ridge(times, dists, matrix)
+        else:
+            self.plot_heatmap(times, dists, matrix)
+
+    def plot_3d(self, times, dists, matrix):
+        self.gl_view.clear()
+        
+        # Add Grid
+        g = gl.GLGridItem()
+        g.setSize(x=max(times)-min(times), y=1, z=0)
+        # Center grid?
+        # Let's map coordinates:
+        # X: Time (0 to T_range)
+        # Y: Distance (0 to 1) -> mapped to e.g. -10 to 10
+        # Z: Value
+        
+        # Normalize Data for display
+        t_min, t_max = times[0], times[-1]
+        
+        # We want X to be centered around 0
+        t_center = (t_max + t_min) / 2
+        t_scale = 20.0 / (t_max - t_min) if t_max > t_min else 1
+        
+        y_scale = 20.0 # Distance 0-1 maps to -10 to 10
+        
+        z_min = np.nanmin(matrix)
+        z_max = np.nanmax(matrix)
+        z_range = z_max - z_min if z_max > z_min else 1
+        z_scale = 10.0 / z_range
+        
+        # Axes
+        axis = gl.GLAxisItem()
+        axis.setSize(x=10, y=10, z=10)
+        self.gl_view.addItem(axis)
+        
+        # Plot lines
+        # matrix is (T, D)
+        # We want lines along Time for each Distance step?
+        # "Vertical to this plane (Time-Value) is the selected locations"
+        # So we draw one line per location index.
+        
+        n_locs = len(dists)
+        # Subsample lines if too many? 50 is fine.
+        
+        for i in range(n_locs):
+            # Location i
+            y_val = (dists[i] - 0.5) * y_scale # Map 0..1 to -10..10
+            
+            vals = matrix[:, i]
+            
+            # X: Time
+            x_vals = (times - t_center) * t_scale
+            
+            # Z: Value
+            z_vals = (vals - z_min) * z_scale
+            
+            # Points
+            pts = np.column_stack([x_vals, np.full_like(x_vals, y_val), z_vals])
+            
+            # Color
+            # Gradient based on distance? Or Value?
+            # Let's use distance color (Rainbow)
+            color = pg.intColor(i, n_locs, alpha=200)
+            color = pg.glColor(color)
+            
+            plt_item = gl.GLLinePlotItem(pos=pts, color=color, width=2, antialias=True)
+            self.gl_view.addItem(plt_item)
+            
+        # Labels? Simple text at corners
+        
+    def plot_ridge(self, times, dists, matrix):
+        self.fig.clear()
+        ax = self.fig.add_subplot(111, projection='3d') # Use 3D projection for ridge/waterfall effectively?
+        # Actually user asked for "Planar visualization" for the alternative.
+        # But "Stacked lines" is often 2D with offset.
+        
+        # Let's do a 2D Waterfall (Offset lines)
+        ax = self.fig.add_subplot(111)
+        
+        n_locs = len(dists)
+        # Select subset of locations to avoid clutter?
+        # If 50 samples, 50 lines is okay.
+        
+        offset_step = (np.nanmax(matrix) - np.nanmin(matrix)) * 0.2
+        if offset_step == 0: offset_step = 1
+        
+        # Iterate backwards to draw front-to-back
+        for i in range(n_locs):
+            vals = matrix[:, i]
+            # Add offset
+            offset = i * offset_step * 0.1 # Small vertical offset
+            
+            ax.plot(times, vals + offset, color=plt.cm.jet(i/n_locs), alpha=0.8)
+            
+        ax.set_xlabel("Time")
+        ax.set_ylabel("Value (+ Offset by Location)")
+        ax.set_title(f"Stacked Time Series ({self.combo_var.currentText()})")
+        self.canvas.draw()
+        
+    def plot_heatmap(self, times, dists, matrix):
+        self.fig.clear()
+        ax = self.fig.add_subplot(111)
+        
+        # Imshow
+        # matrix is (T, D). We usually want Time on X.
+        # So shape is correct for Transpose?
+        # imshow expects (Rows, Cols). 
+        # If we want X=Time, Y=Location.
+        # Rows should be Location, Cols should be Time.
+        # So Transpose matrix.
+        
+        im = ax.imshow(matrix.T, aspect='auto', 
+                       extent=[times[0], times[-1], 0, 1],
+                       origin='lower', cmap='viridis')
+        
+        self.fig.colorbar(im, ax=ax, label="Value")
+        ax.set_xlabel("Time")
+        ax.set_ylabel("Distance along Slice (0-1)")
+        ax.set_title(f"Spatio-Temporal Heatmap ({self.combo_var.currentText()})")
+        self.canvas.draw()
+
+    def export_view(self):
+        mode = self.combo_mode.currentIndex()
+        
+        filename, _ = QFileDialog.getSaveFileName(self, "Export Analysis", "", "PDF (*.pdf);;SVG (*.svg);;PNG (*.png)")
+        if not filename: return
+        
+        if mode == 0:
+            # Export 3D View
+            # Option A: Screenshot (PNG only)
+            # Option B: Re-create in Matplotlib 3D (Vector support)
+            # User wants SVG/PNG.
+            
+            if filename.endswith('.png'):
+                # GL View grabFrameBuffer
+                img = self.gl_view.grabFramebuffer()
+                img.save(filename)
+            else:
+                # Vector export for 3D is tricky. 
+                # Re-draw using Matplotlib 3D
+                self.export_matplotlib_3d(filename)
+                
+        else:
+            # 2D View
+            self.fig.savefig(filename, bbox_inches='tight', dpi=300)
+            
+        QMessageBox.information(self, "Export", f"Saved to {filename}")
+
+    def export_matplotlib_3d(self, filename):
+        times, dists, matrix = self.get_spacetime_data()
+        
+        fig = plt.figure(figsize=(10, 8))
+        ax = fig.add_subplot(111, projection='3d')
+        
+        n_locs = len(dists)
+        
+        # Draw lines
+        for i in range(n_locs):
+            # X: Time, Y: Distance (fixed per line), Z: Value
+            y_val = dists[i] # 0..1
+            vals = matrix[:, i]
+            
+            # Matplotlib 3D: plot(x, y, z)
+            # We want X=Time, Y=Location, Z=Value
+            # Note: mplot3d Y axis is depth
+            
+            ax.plot(times, [y_val]*len(times), vals, 
+                    color=plt.cm.jet(i/n_locs), alpha=0.8)
+            
+        ax.set_xlabel('Time')
+        ax.set_ylabel('Location (Distance)')
+        ax.set_zlabel('Value')
+        ax.view_init(elev=30, azim=-60)
+        
+        # Pane colors transparent
+        ax.xaxis.pane.fill = False
+        ax.yaxis.pane.fill = False
+        ax.zaxis.pane.fill = False
+        
+        fig.savefig(filename, bbox_inches='tight', dpi=300)
+        plt.close(fig)
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
